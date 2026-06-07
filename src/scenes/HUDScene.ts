@@ -77,7 +77,8 @@ export class HUDScene extends Phaser.Scene {
     });
 
     // ── Tab 键切换场景 ──
-    this.input.keyboard?.on('keydown-TAB', () => {
+    this.input.keyboard?.on('keydown-TAB', (event: KeyboardEvent) => {
+      event.preventDefault();
       this.toggleMainScene();
     });
 

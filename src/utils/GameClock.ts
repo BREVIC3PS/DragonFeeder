@@ -8,10 +8,9 @@
  * - GameClock 用"时间累加器"模式：累积渲染帧的 delta，每满 100ms 触发一次逻辑 tick
  *
  * 为什么用 10Hz？
- * - 工厂模拟不需要 60fps 精度（传送带物品移动、机器生产进度）
- * - 降低 CPU 开销（100 个传送带 60fps vs 10fps 差别巨大）
- * - Factorio 本身也是这个思路（它的 UPS = Updates Per Second 默认 60，但可降到 30）
- * - 我们的原型用 10Hz，后续可调整
+ * - 工厂模拟（传送带物品移动、机器生产进度）不需要 60fps 精度
+ * - 降低 CPU 开销
+ * - 渲染层通过 getSubTickFraction() 在两次 tick 间插值，保证 60fps 视觉流畅
  *
  * 使用方式：
  * 1. 某一个永不 sleep 的 Scene.update() 中调用 gameClock.update(delta)
@@ -36,6 +35,21 @@ export class GameClock {
   /** 订阅者列表 */
   private listeners: Set<TickCallback> = new Set();
 
+  /**
+   * 子帧插值比例（0-1）
+   * UE 类比：Fraction 参数，用于在 Fixed Timestep 之间做平滑插值
+   *
+   * 渲染层用这个值在两次 tick 之间 lerp 物品位置：
+   * - 0 = 刚好在本次 tick 的位置
+   * - 0.5 = 在两次 tick 中间
+   * - 接近 1 = 快到下一次 tick
+   *
+   * 这样即使逻辑只有 10Hz，画面上物品也能以 60fps 平滑移动
+   */
+  getSubTickFraction(): number {
+    return this.accumulator / this.tickInterval;
+  }
+
   constructor(tickRate: number = 10) {
     this.tickRate = tickRate;
     this.tickInterval = 1000 / tickRate; // 10Hz = 100ms per tick
@@ -54,8 +68,10 @@ export class GameClock {
    * 渲染帧  delta=16ms  accumulator=98   < 100, 不触发
    * 渲染帧  delta=16ms  accumulator=114  ≥ 100, 触发! → accumulator=14
    * ```
+   * 此时 getSubTickFraction() = 14/100 = 0.14
+   * 渲染层用这个值在两次 tick 间 lerp 物品位置，保证 60fps 视觉流畅
    *
-   * 这样即使渲染帧率波动（30-120fps），逻辑帧始终稳定 10Hz
+   * 这样即使渲染帧率波动，逻辑帧始终稳定 10Hz
    */
   update(delta: number): void {
     this.accumulator += delta;
@@ -65,7 +81,7 @@ export class GameClock {
     // 可能需要触发多次逻辑 tick 来"追赶"——while 确保不丢 tick
     // 但也要设上限，防止"死亡螺旋"（delta 极大时无限循环）
     let ticksThisFrame = 0;
-    const maxTicksPerFrame = 10; // 最多一次追 10 帧（1 秒），超过就丢弃
+    const maxTicksPerFrame = 20; // 最多一次追 20 帧（2 秒），超过就丢弃
 
     while (this.accumulator >= this.tickInterval && ticksThisFrame < maxTicksPerFrame) {
       this.accumulator -= this.tickInterval;
@@ -73,7 +89,7 @@ export class GameClock {
       ticksThisFrame++;
 
       // 触发所有订阅者，传递固定时间步长（秒）
-      const dtSeconds = this.tickInterval / 1000; // 0.1 秒
+      const dtSeconds = this.tickInterval / 1000; // 0.1 秒 (10Hz)
       for (const listener of this.listeners) {
         try {
           listener(dtSeconds);
