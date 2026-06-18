@@ -52,13 +52,15 @@ export class DragonLogic {
     this.state.hunger = Math.max(0, this.state.hunger - food.hungerRestore);
     this.state.happiness = Math.min(100, this.state.happiness + food.happinessGain);
 
-    const moodChanged = this.state.mood !== this.previousMood;
-    this.previousMood = this.state.mood;
+    const oldMood = this.previousMood;
+    const newMood = this.state.mood;
+    const moodChanged = newMood !== oldMood;
 
     if (moodChanged) {
-      console.log(`[DragonLogic] 心情变化: ${this.previousMood} → ${this.state.mood}`);
+      console.log(`[DragonLogic] 心情变化: ${oldMood} → ${newMood}`);
     }
 
+    this.previousMood = newMood;
     return moodChanged;
   }
 

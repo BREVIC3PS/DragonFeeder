@@ -6,6 +6,14 @@ import { Dragon } from '../entities/dragon/Dragon';
 import { FOODS, type FoodDef } from '../data/FoodData';
 import { EventBus } from '../events/EventBus';
 import { ScaleSystem } from '../systems/ScaleSystem';
+import {
+  DRAGON_HUNGER_RATE, DRAGON_HAPPINESS_DECAY, AUTO_FEED_HUNGER_THRESHOLD,
+} from '../data/GameConfig';
+import { SpeechBubble } from '../entities/dragon/SpeechBubble';
+import {
+  DIALOGUE_HUNGRY, DIALOGUE_AFTER_EAT,
+  DIALOGUE_HAPPY, DIALOGUE_UNHAPPY, pickDialogue,
+} from '../data/DialogueData';
 
 /**
  * DragonScene — 龙宝宝主场景
@@ -21,7 +29,23 @@ export class DragonScene extends Phaser.Scene {
   private scaleSystem!: ScaleSystem;
 
   private inventory!: Record<string, number>;
-  private autoFeed: boolean = false; // Step 8: 自动喂食开关
+  private autoFeed: boolean = false;
+
+  // 表情气泡
+  private speechBubble: SpeechBubble | null = null;
+  private idleBubbleTimer: number = 0;     // 空闲气泡计时器（秒）
+  private hungryBubbleTimer: number = 0;
+
+  // 互动系统
+  private clickCount: number = 0;
+  private clickWindowTimer: number = 0;
+  private isLongPressing: boolean = false;
+  private longPressTimer: number = 0;
+  private petInterval: number = 0;
+
+  // 取消订阅句柄
+  private tickUnsub?: () => void;
+  private foodProducedUnsub?: () => void;
 
   // 渲染
   private hungerBarGfx!: Phaser.GameObjects.Graphics;
@@ -51,10 +75,12 @@ export class DragonScene extends Phaser.Scene {
     this.gameClock = this.game.registry.get('gameClock') as GameClock;
 
     // ── 核心组件 ──
-    this.dragonState = new DragonState();
-    this.dragonLogic = new DragonLogic(this.dragonState);
+    // 复用 BootScene 在 registry 中预创建的 DragonState 实例
+    // （不再 new DragonState() 后覆写 registry，避免 FactoryScene 已捕获的引用失效）
+    this.dragonState = this.game.registry.get('dragonState') as DragonState;
+    // 使用 GameConfig 中的速率参数（而非默认值）
+    this.dragonLogic = new DragonLogic(this.dragonState, DRAGON_HUNGER_RATE, DRAGON_HAPPINESS_DECAY);
     this.scaleSystem = new ScaleSystem(this.dragonState);
-    this.game.registry.set('dragonState', this.dragonState);
 
     this.inventory = this.game.registry.get('foodInventory') as Record<string, number>;
 
@@ -75,6 +101,9 @@ export class DragonScene extends Phaser.Scene {
     this.dragon = new Dragon(this, 512, 320, this.dragonState);
     this.dragon.setDepth(10);
 
+    // ── 龙宝宝交互（点击 + 长按抚摸） ──
+    this.setupDragonInteraction();
+
     // ── 龙鳞计数（右上角大字） ──
     this.scalesLabel = this.add.text(880, 18, '', {
       fontSize: '22px', color: '#ffd700', fontFamily: 'Arial',
@@ -89,11 +118,14 @@ export class DragonScene extends Phaser.Scene {
     this.createFoodButtons();
 
     // ── 逻辑帧（10Hz） ──
-    this.gameClock.onTick((dt: number) => {
+    this.tickUnsub = this.gameClock.onTick((dt: number) => {
       this.dragonLogic.update(dt);
       this.scaleSystem.update(dt);
-      this.refreshUIText();
-      // 自动喂食：每次 tick 检查
+      if (this.scene.isActive()) {
+        this.refreshUIText();
+        this.updateSpeechBubbles(dt);
+      }
+      this.updateInteractionTimers(dt);
       if (this.autoFeed) {
         this.tryAutoFeed();
       }
@@ -101,25 +133,34 @@ export class DragonScene extends Phaser.Scene {
 
     // ── 渲染帧（60fps）─ 只画 ──
     this.events.on('update', () => {
-      this.dragon.updateVisuals();
+      const dt = this.game.loop.delta / 1000; // 秒
+      this.dragon.updateVisuals(dt);
       this.drawStatusBars();
     });
 
     // ── Step 8: 工厂食物 → 库存（不是直接喂龙） ──
-    EventBus.on('food_produced', (data: unknown) => {
+    this.foodProducedUnsub = EventBus.on('food_produced', (data: unknown) => {
       const { foodId } = data as { foodId: string };
       // 自动喂食模式：直接喂龙，不走库存
       if (this.autoFeed) {
         const food = FOODS[foodId];
         if (food) {
           this.doFeedDragon(food);
-          this.showFloatingText(`🏭 ${food.emoji}`, this.dragon.x, this.dragon.y - 80, '#88ffaa');
+          if (this.scene.isActive()) {
+            this.showFloatingText(`🏭 ${food.emoji}`, this.dragon.x, this.dragon.y - 80, '#88ffaa');
+          }
         }
       } else {
         // 默认：加到库存
         this.inventory[foodId] = (this.inventory[foodId] ?? 0) + 1;
-        console.log(`[DragonScene] 工厂产出 +1 ${foodId} → 库存 ${this.inventory[foodId]}`);
       }
+    });
+
+    // ── 场景销毁时清理回调（防止内存泄漏） ──
+    this.events.on('shutdown', () => {
+      this.tickUnsub?.();
+      this.foodProducedUnsub?.();
+      console.log('[DragonScene] 回调已清理');
     });
 
     console.log('[DragonScene] 就绪');
@@ -151,8 +192,9 @@ export class DragonScene extends Phaser.Scene {
     });
   }
 
-  /** 自动喂食：库存有食物且龙饿了就喂 */
+  /** 自动喂食：只在龙饱足度不够时才喂（阈值只 GameConfig），避免浪费 */
   private tryAutoFeed(): void {
+    if (this.dragonState.hunger <= AUTO_FEED_HUNGER_THRESHOLD) return; // 不饿，不喂
     // 优先喂满意度最高的食物
     const foods = [FOODS.cake, FOODS.meat, FOODS.bread];
     for (const food of foods) {
@@ -329,6 +371,9 @@ export class DragonScene extends Phaser.Scene {
     this.spawnEatParticles(food.color);
     this.showFloatingText('啊呜!', this.dragon.x, this.dragon.y - 80, '#ffffff');
 
+    // 吃完后立刻弹出气泡
+    this.showBubble(pickDialogue(DIALOGUE_AFTER_EAT));
+
     if (moodChanged) {
       this.time.delayedCall(800, () => {
         const moodEmoji: Record<string, string> = {
@@ -351,20 +396,22 @@ export class DragonScene extends Phaser.Scene {
     const foodSprite = this.add.rectangle(fromX, fromY, 20, 20, food.color);
     foodSprite.setDepth(50);
 
-    this.tweens.add({
-      targets: foodSprite,
-      x: this.dragon.x,
-      duration: 500,
-      ease: 'Quad.easeIn',
-    });
+    // 用 dummy 对象驱动单个 tween，避免双 tween 竞态导致 progress 为 0
+    const dummy = { t: 0 };
+    const targetX = this.dragon.x;
+    const targetY = this.dragon.y;
 
     this.tweens.add({
-      targets: foodSprite,
+      targets: dummy,
+      t: 1,
       duration: 500,
-      onUpdate: (tween) => {
-        const progress = tween.progress;
-        const arcOffset = -60 * Math.sin(progress * Math.PI);
-        foodSprite.y = Phaser.Math.Linear(fromY, this.dragon.y, progress) + arcOffset;
+      ease: 'Quad.easeInOut',
+      onUpdate: () => {
+        const progress = dummy.t;
+        // 抛物线弧线：中间升高 60px 再落下，食物飞向龙嘴巴
+        const arcOffset = -80 * Math.sin(progress * Math.PI);
+        foodSprite.x = Phaser.Math.Linear(fromX, targetX, progress);
+        foodSprite.y = Phaser.Math.Linear(fromY, targetY, progress) + arcOffset;
       },
       onComplete: () => {
         foodSprite.destroy();
@@ -410,5 +457,171 @@ export class DragonScene extends Phaser.Scene {
       duration: 1000, ease: 'Quad.easeOut',
       onComplete: () => floatText.destroy(),
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 龙宝宝交互（点击 + 长按抚摸）
+  // ═══════════════════════════════════════════════════════════════
+
+  private dragonPointerDown: boolean = false;
+
+  private setupDragonInteraction(): void {
+    // Dragon 是 Container，需要设置一个 hit area 才能响应输入
+    this.dragon.setInteractive(
+      new Phaser.Geom.Circle(0, 0, 55), // 身体大小的圆形碰撞区
+      Phaser.Geom.Circle.Contains,
+    );
+
+    this.dragon.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      pointer.event.stopPropagation(); // 不冒泡到场景
+      this.dragonPointerDown = true;
+      if (!this.isLongPressing) {
+        this.handleDragonClick();
+      }
+    });
+
+    this.dragon.on('pointerup', () => {
+      this.dragonPointerDown = false;
+      if (this.isLongPressing) {
+        this.stopPetting();
+      }
+      this.longPressTimer = 0;
+    });
+
+    this.dragon.on('pointerout', () => {
+      this.dragonPointerDown = false;
+      if (this.isLongPressing) {
+        this.stopPetting();
+      }
+      this.longPressTimer = 0;
+    });
+  }
+
+  private handleDragonClick(): void {
+    this.dragonState.totalClicks++;
+    this.clickCount++;
+
+    // 5 秒窗口内点击
+    if (this.clickCount === 1) {
+      // 第一次点击：惊讶
+      this.showBubble('?');
+    } else if (this.clickCount >= 10) {
+      // 5 秒内超过 10 次：烦躁
+      this.showBubble('别戳了！');
+      this.dragonState.happiness = Math.max(0, this.dragonState.happiness - 2);
+      this.clickCount = 0;
+      this.clickWindowTimer = 0;
+    } else if (this.clickCount >= 3) {
+      // 连点超过 3 次：开心
+      this.showBubble('嘿嘿~');
+      this.dragonState.happiness = Math.min(100, this.dragonState.happiness + 1);
+      this.playHeartParticle();
+    }
+  }
+
+  private updateInteractionTimers(dt: number): void {
+    // 点击窗口计时：5 秒重置
+    if (this.clickCount > 0) {
+      this.clickWindowTimer += dt;
+      if (this.clickWindowTimer >= 5) {
+        this.clickCount = 0;
+        this.clickWindowTimer = 0;
+      }
+    }
+
+    // 长按检测（500ms threshold）
+    if (this.dragonPointerDown && !this.isLongPressing) {
+      this.longPressTimer += dt;
+      if (this.longPressTimer >= 0.5) {
+        this.startPetting();
+      }
+    }
+
+    // 抚摸期间生成心形粒子
+    if (this.isLongPressing) {
+      this.petInterval += dt;
+      if (this.petInterval >= 0.5) {
+        this.petInterval -= 0.5;
+        this.playHeartParticle();
+        this.dragonState.happiness = Math.min(100, this.dragonState.happiness + 0.5);
+      }
+    }
+  }
+
+  private startPetting(): void {
+    this.isLongPressing = true;
+    this.dragonState.totalPats++;
+    console.log('[DragonScene] 开始抚摸');
+  }
+
+  private stopPetting(): void {
+    this.isLongPressing = false;
+    this.petInterval = 0;
+  }
+
+  /** 心形粒子从龙身上飘出 */
+  private playHeartParticle(): void {
+    const startX = this.dragon.x + Phaser.Math.Between(-20, 20);
+    const startY = this.dragon.y - 30;
+
+    const heart = this.add.text(startX, startY, '♥', {
+      fontSize: `${Phaser.Math.Between(12, 20)}px`,
+      color: '#ff4488',
+      fontFamily: 'Arial',
+    }).setOrigin(0.5, 0.5).setDepth(150);
+
+    this.tweens.add({
+      targets: heart,
+      x: startX + Phaser.Math.Between(-40, 40),
+      y: startY - Phaser.Math.Between(50, 100),
+      alpha: 0,
+      duration: Phaser.Math.Between(800, 1500),
+      ease: 'Quad.easeOut',
+      onComplete: () => heart.destroy(),
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 表情气泡系统
+  // ═══════════════════════════════════════════════════════════════
+
+  /** 显示/替换气泡（同一时间最多一个） */
+  private showBubble(text: string): void {
+    if (this.speechBubble && this.speechBubble.active) {
+      this.speechBubble.replaceText(text);
+    } else {
+      this.speechBubble = new SpeechBubble(
+        this, this.dragon.x, this.dragon.y - 90, text,
+      ).follow(this.dragon, -90);
+    }
+  }
+
+  /** 每逻辑帧更新气泡触发条件 */
+  private updateSpeechBubbles(dt: number): void {
+    const hunger = this.dragonState.hunger;
+    const happiness = this.dragonState.happiness;
+
+    // 饥饿触发（hunger >= 30 且 < 70，每 8 秒）
+    if (hunger >= 30 && hunger < 70) {
+      this.hungryBubbleTimer += dt;
+      if (this.hungryBubbleTimer >= 8) {
+        this.hungryBubbleTimer = 0;
+        this.showBubble(pickDialogue(DIALOGUE_HUNGRY));
+      }
+    } else {
+      this.hungryBubbleTimer = 0;
+    }
+
+    // 满意度高触发（happiness > 80，每 15 秒）
+    // 满意度低触发（happiness < 30，每 15 秒）
+    this.idleBubbleTimer += dt;
+    if (this.idleBubbleTimer >= 15) {
+      this.idleBubbleTimer = 0;
+      if (happiness > 80) {
+        this.showBubble(pickDialogue(DIALOGUE_HAPPY));
+      } else if (happiness < 30) {
+        this.showBubble(pickDialogue(DIALOGUE_UNHAPPY));
+      }
+    }
   }
 }

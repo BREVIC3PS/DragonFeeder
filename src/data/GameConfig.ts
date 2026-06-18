@@ -10,8 +10,10 @@
 // 一、时间与时钟
 // ═══════════════════════════════════════════════════════════════
 
-/** 逻辑帧频率（Hz），越高模拟越精细但 CPU 开销越大 */
-export const TICK_RATE = 30;
+/** 逻辑帧频率（Hz），越高模拟越精细但 CPU 开销越大。
+ *  修改后需要同步更新 GameClock 构造参数（BootScene.ts）。
+ *  当前统一使用 10Hz（10 tick/s = 每 tick 0.1 秒）。 */
+export const TICK_RATE = 10;
 
 // ═══════════════════════════════════════════════════════════════
 // 二、龙宝宝
@@ -26,11 +28,15 @@ export const DRAGON_INIT_HAPPINESS = 50;
 /** 龙鳞初始数量 */
 export const DRAGON_INIT_SCALES = 10;
 
-/** 饥饿增长速度（单位/秒），越高饿得越快 */
-export const DRAGON_HUNGER_RATE = 3000;
+/** 饥饿增长速度（单位/秒），越高饿得越快。默认 0.3/秒 = 约 5.5 分钟从饱到饿。 */
+export const DRAGON_HUNGER_RATE = 0.3;
 
-/** 满意度衰减速度（单位/秒），越高掉得越快 */
-export const DRAGON_HAPPINESS_DECAY = 20;
+/** 满意度衰减速度（单位/秒），越高掉得越快。默认 0.2/秒。 */
+export const DRAGON_HAPPINESS_DECAY = 0.2;
+
+/** 自动喂食触发阈值：饥饿度 ≤ 此值时不喂（避免浪费食物）。
+ *  也即：只有饥饿度 > AUTO_FEED_HUNGER_THRESHOLD 时自动喂食才会扣食物。 */
+export const AUTO_FEED_HUNGER_THRESHOLD = 20;
 
 /** 心情判定阈值 */
 
@@ -48,20 +54,7 @@ export const MOOD_UNHAPPY_THRESHOLD = 30;
 // 三、食物
 // ═══════════════════════════════════════════════════════════════
 
-export interface FoodConfig {
-  id: string;
-  name: string;
-  emoji: string;
-  color: number;          // hex 0xRRGGBB
-  hungerRestore: number;  // 恢复饥饿值
-  happinessGain: number;  // 增加满意度
-}
-
-export const FOOD_CONFIGS: FoodConfig[] = [
-  { id: 'bread', name: '面包', emoji: '🍞', color: 0xffdd44, hungerRestore: 15, happinessGain: 5 },
-  { id: 'meat',  name: '肉',   emoji: '🥩', color: 0xff4444, hungerRestore: 25, happinessGain: 10 },
-  { id: 'cake',  name: '蛋糕', emoji: '🍰', color: 0xff88cc, hungerRestore: 10, happinessGain: 20 },
-];
+// FOOD_CONFIGS 已移除 — 统一使用 src/data/FoodData.ts 中的 FOODS 定义
 
 /** 初始食物库存 */
 export const INIT_FOOD_INVENTORY: Record<string, number> = {
@@ -103,35 +96,8 @@ export const SOURCE_MAX_BUFFER = 10;
 // 六、工厂 — 生产配方
 // ═══════════════════════════════════════════════════════════════
 
-export interface RecipeConfig {
-  id: string;
-  name: string;
-  inputs: { type: string; count: number }[];
-  outputs: { type: string; count: number }[];
-  /** 生产周期（tick 数），越小越快 */
-  duration: number;
-}
-
-export const RECIPE_CONFIGS: RecipeConfig[] = [
-  {
-    id: 'bake_bread', name: '烘焙面包',
-    inputs: [{ type: 'wheat', count: 2 }, { type: 'water', count: 1 }],
-    outputs: [{ type: 'bread', count: 1 }],
-    duration: 30, // 3 秒
-  },
-  {
-    id: 'cook_meat', name: '烹饪肉',
-    inputs: [{ type: 'meat_raw', count: 3 }],
-    outputs: [{ type: 'meat', count: 1 }],
-    duration: 20, // 2 秒
-  },
-  {
-    id: 'bake_cake', name: '烘焙蛋糕',
-    inputs: [{ type: 'wheat', count: 2 }, { type: 'sugar', count: 1 }],
-    outputs: [{ type: 'cake', count: 1 }],
-    duration: 40, // 4 秒
-  },
-];
+// 配方定义统一在 src/core/factory/Recipe.ts 中（RECIPES 数组）。
+// 这里不再重复定义，避免两份数据不一致。
 
 // ═══════════════════════════════════════════════════════════════
 // 七、工厂 — 生产机器

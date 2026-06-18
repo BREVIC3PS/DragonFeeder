@@ -37,8 +37,10 @@ function getPortPos(
   else if (entity instanceof DragonFeederLogic) w = 72;
   else w = 60;
   const dir = isInput ? -1 : 1;
+  // Feeder：动态端口间距，支持无限端口
   const spacing = entity instanceof DragonFeederLogic ? 18 : 30;
-  const baseY = entity.y - (entity instanceof DragonFeederLogic ? 18 : 30) + port * spacing;
+  const baseOffset = entity instanceof DragonFeederLogic ? 18 : 30;
+  const baseY = entity.y - baseOffset + port * spacing;
   return { x: entity.x + dir * (w / 2 + 10), y: baseY };
 }
 
@@ -100,18 +102,31 @@ export class FactoryScene extends Phaser.Scene {
   private buildToolbar: Phaser.GameObjects.Container | null = null;
   private occupiedCells: Set<string> = new Set();
 
+  // 取消订阅句柄（shutdown 时清理）
+  private tickUnsub?: () => void;
+
+  // WASD 键盘移动相机
+  private keys!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key; };
+
   // 拖拽状态
   private cameraDragging: boolean = false;
   private buildingDragTarget: { entityId: string; type: 'source' | 'machine' | 'feeder' } | null = null;
-  private dragOffsetX: number = 0;
-  private dragOffsetY: number = 0;
 
-  // UI 元素追踪（不受相机缩放/平移影响）
-  private uiElements: (Phaser.GameObjects.Text | Phaser.GameObjects.Rectangle | Phaser.GameObjects.Container)[] = [];
+  // ── 双相机系统：主相机（可缩放/滚动的工厂世界） + UI相机（固定屏幕） ──
 
-  private trackUI<T extends { setScrollFactor(v: number): unknown }>(obj: T): T {
+  /** 工厂世界容器：所有建筑/传送带/物品的父节点。
+   *  UI 相机会 ignore 此容器，确保工厂元素只被主相机渲染。 */
+  private worldLayer!: Phaser.GameObjects.Container;
+
+  /** UI 相机：不缩放、不滚动，专用于渲染屏幕固定 UI 元素 */
+  private uiCam!: Phaser.Cameras.Scene2D.Camera;
+
+  /** 将对象添加为 UI 元素（固定在屏幕上，不受主相机缩放影响）。
+   *  使用 setScrollFactor(0) 确保 Phaser 的输入系统正确处理点击坐标，
+   *  同时让主相机 ignore 该元素（由 uiCam 负责渲染）。 */
+  private trackUI<T extends Phaser.GameObjects.GameObject & { setScrollFactor(v: number): unknown }>(obj: T): T {
     obj.setScrollFactor(0);
-    this.uiElements.push(obj as unknown as Phaser.GameObjects.Text);
+    this.cameras.main.ignore(obj);
     return obj;
   }
 
@@ -127,14 +142,25 @@ export class FactoryScene extends Phaser.Scene {
     this.factoryWorld = createDefaultFactory();
     this.game.registry.set('factoryWorld', this.factoryWorld);
 
+    // ── 双相机：UI 相机（固定屏幕，不缩放不滚动） ──
+    this.uiCam = this.cameras.add(0, 0, 1024, 768);
+    this.uiCam.setScroll(0, 0);
+    // 不设置 zoom → 永远 1.0，UI 元素大小不变
+
+    // ── 工厂世界容器（所有可缩放的对象都放这里） ──
+    this.worldLayer = this.add.container(0, 0);
+    this.uiCam.ignore(this.worldLayer); // UI 相机跳过整个工厂世界
+
     // 禁止浏览器右键菜单
     this.input.mouse?.disableContextMenu();
 
     // 缓存传送带端点（只算一次）
     this.cachedEndpoints = buildBeltEndpoints(this.factoryWorld);
 
-    // ── 背景 ──
-    this.add.rectangle(512, 384, 1024, 768, 0x1a1a2e, 0.3).setDepth(0);
+    // ── 背景（放入世界容器） ──
+    const bg = this.add.rectangle(512, 384, 1024, 768, 0x1a1a2e, 0.3).setDepth(0);
+    this.worldLayer.add(bg);
+
     this.trackUI(this.add.text(512, 15, '🏭 工厂 — 自动化食物生产', {
       fontSize: '20px', color: '#ffaa44', fontFamily: 'Arial',
     }).setOrigin(0.5, 0).setDepth(50));
@@ -142,9 +168,11 @@ export class FactoryScene extends Phaser.Scene {
     // ── 静态建筑（用 GameObjects，只创建一次，GPU 缓存） ──
     this.createStaticBuildings();
 
-    // ── 动态 Graphics 层 ──
+    // ── 动态 Graphics 层（放入世界容器） ──
     this.dynGfx = this.add.graphics().setDepth(11);
+    this.worldLayer.add(this.dynGfx);
     this.beltItemGfx = this.add.graphics().setDepth(12);
+    this.worldLayer.add(this.beltItemGfx);
 
     // ── UI ──
     this.scalesText = this.trackUI(this.add.text(820, 12, '', {
@@ -154,10 +182,13 @@ export class FactoryScene extends Phaser.Scene {
     this.createInventoryDisplay();
     this.createBoostButton();
 
-    // ── 模式 Graphics 层 ──
+    // ── 模式 Graphics 层（放入世界容器） ──
     this.gridGfx = this.add.graphics().setDepth(7).setVisible(false);
+    this.worldLayer.add(this.gridGfx);
     this.ghostGfx = this.add.graphics().setDepth(13).setVisible(false);
+    this.worldLayer.add(this.ghostGfx);
     this.wireGfx = this.add.graphics().setDepth(14).setVisible(false);
+    this.worldLayer.add(this.wireGfx);
 
     // ── 模式切换按钮 ──
     this.createModeButtons();
@@ -173,11 +204,7 @@ export class FactoryScene extends Phaser.Scene {
       const delta = dy > 0 ? -0.1 : 0.1;
       const newZoom = Phaser.Math.Clamp(this.cameras.main.zoom + delta, 0.5, 2.0);
       this.cameras.main.setZoom(newZoom);
-      // UI 元素反向缩放，保持屏幕大小不变
-      const inv = 1 / newZoom;
-      for (const el of this.uiElements) {
-        el.setScale(inv);
-      }
+      // UI 元素通过 setScrollFactor(0) 固定在屏幕位置，缩放由主相机统一处理
     });
 
     // ── 输入 ──
@@ -221,16 +248,36 @@ export class FactoryScene extends Phaser.Scene {
       if (this.mode !== 'normal') { e.preventDefault(); this.setMode('normal'); }
     });
 
-    // ── 渲染帧（60fps）：只画动态元素（便宜） ──
+    // ── WASD 相机移动 ──
+    if (this.input.keyboard) {
+      this.keys = {
+        W: this.input.keyboard.addKey('W'),
+        A: this.input.keyboard.addKey('A'),
+        S: this.input.keyboard.addKey('S'),
+        D: this.input.keyboard.addKey('D'),
+      };
+    }
+
+    // ── 渲染帧（60fps）：画动态元素 + 相机移动 ──
     this.events.on('update', () => {
       this.renderDynamicLayer();
       this.renderModeOverlay();
+      this.handleWASDCamera();
     });
 
-    // ── 逻辑帧（10Hz）：更新 UI 文字（贵） ──
-    this.gameClock.onTick((_dt: number) => {
+    // ── 逻辑帧（10Hz）：驱动工厂 + 更新 UI ──
+    this.tickUnsub = this.gameClock.onTick((_dt: number) => {
       this.factoryWorld.update(_dt);
-      this.refreshUIText();
+      // 只在场景活跃时更新 UI 文字（sleep 时不做无用的 setText）
+      if (this.scene.isActive()) {
+        this.refreshUIText();
+      }
+    });
+
+    // ── 场景销毁时清理（防止内存泄漏） ──
+    this.events.on('shutdown', () => {
+      this.tickUnsub?.();
+      console.log('[FactoryScene] 回调已清理');
     });
 
     console.log('[FactoryScene] 工厂已启动');
@@ -241,8 +288,9 @@ export class FactoryScene extends Phaser.Scene {
   // ═══════════════════════════════════════════════════════════════
 
   private createStaticBuildings(): void {
-    // 传送带线（静态 Graphics，belt 变化时重绘）
+    // 传送带线（静态 Graphics，belt 变化时重绘）→ 放入世界容器
     this.beltStaticGfx = this.add.graphics().setDepth(8);
+    this.worldLayer.add(this.beltStaticGfx);
     this.drawAllBeltLines();
 
     // 采集器
@@ -281,6 +329,7 @@ export class FactoryScene extends Phaser.Scene {
       fontSize: '11px', color: '#aaaaaa', fontFamily: 'Arial',
     }).setOrigin(0.5, 0));
     this.sourceGfx.set(src.id, container);
+    this.worldLayer.add(container); // 放入世界层（受主相机缩放影响）
     return container;
   }
 
@@ -303,10 +352,12 @@ export class FactoryScene extends Phaser.Scene {
       }).setOrigin(0.5, 0).setDepth(15));
     }
     this.machineGfx.set(m.id, container);
-    // 状态文字（由 refreshUIText 更新）
+    this.worldLayer.add(container); // 放入世界层
+    // 状态文字（由 refreshUIText 更新）→ 也放入世界层
     const statusTxt = this.add.text(m.x, m.y + h / 2 + 4, '', {
       fontSize: '10px', color: '#ffffff', fontFamily: 'Arial',
     }).setOrigin(0.5, 0).setDepth(16);
+    this.worldLayer.add(statusTxt);
     this.machineStatusTexts.set(m.id, statusTxt);
     return container;
   }
@@ -320,12 +371,40 @@ export class FactoryScene extends Phaser.Scene {
       fontSize: '12px', color: '#ffffff', fontFamily: 'Arial', align: 'center',
     }).setOrigin(0.5, 0.5).setDepth(15));
     this.feederGfx = container;
+    this.worldLayer.add(container); // 放入世界层
     return container;
   }
 
   private rebuildAllBeltLines(): void {
     this.cachedEndpoints = buildBeltEndpoints(this.factoryWorld);
     this.drawAllBeltLines();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // WASD 相机移动（每个渲染帧检查，支持组合按键）
+  // ═══════════════════════════════════════════════════════════════
+
+  /** 相机移动速度（像素/秒，缩放前） */
+  private readonly CAM_PAN_SPEED = 400;
+
+  private handleWASDCamera(): void {
+    if (!this.keys) return;
+    if (this.mode === 'build' || this.mode === 'belt_edit') return; // 编辑模式下禁止移动
+    if (this.cameraDragging || this.buildingDragTarget) return;     // 拖拽时让鼠标拖拽优先
+
+    const cam = this.cameras.main;
+    const dt = this.game.loop.delta / 1000; // 秒
+    // 除以 zoom：放大时移动慢，缩小时移动快（手感一致）
+    const step = (this.CAM_PAN_SPEED * dt) / cam.zoom;
+
+    let dx = 0, dy = 0;
+    if (this.keys.A.isDown) dx -= step;
+    if (this.keys.D.isDown) dx += step;
+    if (this.keys.W.isDown) dy -= step;
+    if (this.keys.S.isDown) dy += step;
+    if (dx === 0 && dy === 0) return;
+
+    cam.setScroll(cam.scrollX + dx, cam.scrollY + dy);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -384,23 +463,31 @@ export class FactoryScene extends Phaser.Scene {
       this.dynGfx.fillRect(cx - barW / 2, barY, barW * progress, barH);
     }
 
-    // 端口灯（6 个 — 3 输入 + 3 输出）
+    // 端口灯（6 个 — 3 输入 + 3 输出），阻塞的输出端口标红
     const portSize = 8;
     for (let port = 0; port < 3; port++) {
       const py = cy - 30 + port * 30;
       // 输入
       this.dynGfx.fillStyle(m.getInputCount(port) > 0 ? 0x44aa44 : 0x444444, 0.8);
       this.dynGfx.fillRect(cx - w / 2 - portSize - 2, py - portSize / 2, portSize, portSize);
-      // 输出
-      this.dynGfx.fillStyle(m.getOutputCount(port) > 0 ? 0xcc8844 : 0x444444, 0.8);
+      // 输出：阻塞端口标红（出料口满了无法继续生产）
+      const blocked = m.blockedOutputPorts.has(port);
+      this.dynGfx.fillStyle(blocked ? 0xff2222 : (m.getOutputCount(port) > 0 ? 0xcc8844 : 0x444444), 0.9);
       this.dynGfx.fillRect(cx + w / 2 + 2, py - portSize / 2, portSize, portSize);
+      if (blocked) {
+        // 红色边框强调
+        this.dynGfx.lineStyle(1, 0xff4444, 0.8);
+        this.dynGfx.strokeRect(cx + w / 2 + 2, py - portSize / 2, portSize, portSize);
+      }
     }
   }
 
   private renderFeederPorts(feeder: DragonFeederLogic): void {
     const cx = feeder.x, cy = feeder.y;
     const w = 72;
-    for (let port = 0; port < 3; port++) {
+    // 动态渲染所有已连接的输入端口（支持无限个传送带接入）
+    const portCount = Math.max(3, feeder.getConnectedPortCount());
+    for (let port = 0; port < portCount; port++) {
       const py = cy - 18 + port * 18;
       this.dynGfx.fillStyle(feeder.getInputCount(port) > 0 ? 0xcc66aa : 0x444444, 0.8);
       this.dynGfx.fillRect(cx - w / 2 - 10, py - 4, 8, 8);
@@ -571,6 +658,10 @@ export class FactoryScene extends Phaser.Scene {
       fontStyle: 'bold', stroke: '#000000', strokeThickness: 2,
     }).setOrigin(0.5, 0.5).setDepth(100);
 
+    // UI 元素：固定屏幕位置 + 仅 UI 相机渲染（不受缩放影响）
+    fb.setScrollFactor(0);
+    this.cameras.main.ignore(fb);
+
     this.tweens.add({
       targets: fb, y: 35, alpha: 0,
       duration: 1500, ease: 'Quad.easeOut',
@@ -730,7 +821,9 @@ export class FactoryScene extends Phaser.Scene {
     if (this.factoryWorld.feeder) allEntities.push(this.factoryWorld.feeder);
 
     for (const entity of allEntities) {
-      const portCount = entity instanceof DragonFeederLogic ? 3 : (entity instanceof SourceLogic ? 1 : 3);
+      const portCount = entity instanceof DragonFeederLogic
+        ? Math.max(3, entity.getConnectedPortCount() + 1) // Feeder: 动态端口（已连接的 + 1 个空位）
+        : (entity instanceof SourceLogic ? 1 : 3);
       // 输出端口（橙色圆点）
       if (!(entity instanceof DragonFeederLogic)) {
         for (let p = 0; p < portCount; p++) {
@@ -741,7 +834,9 @@ export class FactoryScene extends Phaser.Scene {
       }
       // 输入端口 — 已占用显示红色，空闲显示绿色
       if (entity instanceof MachineLogic || entity instanceof DragonFeederLogic) {
-        const inputCount = entity instanceof DragonFeederLogic ? 3 : 3;
+        const inputCount = entity instanceof DragonFeederLogic
+          ? Math.max(3, entity.getConnectedPortCount() + 1)
+          : 3;
         for (let p = 0; p < inputCount; p++) {
           const pos = getPortPos(entity, p, true);
           const occupied = this.isInputPortOccupied(entity.id, p);
@@ -774,13 +869,14 @@ export class FactoryScene extends Phaser.Scene {
 
   private handleLeftClick(pointer: Phaser.Input.Pointer): void {
     if (this.mode === 'build') {
-      this.handleBuildClick(pointer);
+      // 建造模式：先尝试拖拽已有建筑（grid 吸附），点击空白才放置新建筑
+      if (!this.tryStartBuildingDrag(pointer)) {
+        this.handleBuildClick(pointer);
+      }
     } else if (this.mode === 'belt_edit') {
       this.handleBeltEditClick(pointer);
-    } else {
-      // 普通模式：尝试开始拖拽建筑
-      this.tryStartBuildingDrag(pointer);
     }
+    // 非建造/编辑模式：不响应左键拖拽建筑
   }
 
   private handleRightClick(pointer: Phaser.Input.Pointer): void {
@@ -792,7 +888,13 @@ export class FactoryScene extends Phaser.Scene {
   // 建筑拖拽
   // ═══════════════════════════════════════════════════════════════
 
-  private tryStartBuildingDrag(pointer: Phaser.Input.Pointer): void {
+  /**
+   * 尝试开始拖拽建筑。建造模式下 grid 吸附，非建造模式不响应。
+   * @returns true=已开始拖拽，false=未命中任何建筑
+   */
+  private tryStartBuildingDrag(pointer: Phaser.Input.Pointer): boolean {
+    if (this.mode !== 'build') return false; // 只在建造模式下允许拖拽建筑
+
     const threshold = 40;
     let entity: SourceLogic | MachineLogic | DragonFeederLogic | null = null;
     let type: 'source' | 'machine' | 'feeder' = 'source';
@@ -813,19 +915,25 @@ export class FactoryScene extends Phaser.Scene {
         Phaser.Math.Distance.Between(pointer.worldX, pointer.worldY, this.factoryWorld.feeder.x, this.factoryWorld.feeder.y) < threshold) {
       entity = this.factoryWorld.feeder; type = 'feeder';
     }
-    if (!entity) return;
+    if (!entity) return false;
 
     this.buildingDragTarget = { entityId: entity.id, type };
-    this.dragOffsetX = entity.x - pointer.worldX;
-    this.dragOffsetY = entity.y - pointer.worldY;
+
+    // 拖拽开始时清除该建筑占用的格子（避免自己挡住自己）
+    this.refreshOccupiedCellsExcept(entity.id);
+
+    return true;
   }
 
   private updateBuildingDrag(pointer: Phaser.Input.Pointer): void {
     if (!this.buildingDragTarget) return;
     const entity = this.factoryWorld.getEntityById(this.buildingDragTarget.entityId);
     if (!entity) { this.buildingDragTarget = null; return; }
-    entity.x = pointer.worldX + this.dragOffsetX;
-    entity.y = pointer.worldY + this.dragOffsetY;
+
+    // 建造模式下：grid 吸附（建筑跟随鼠标所在格子中心）
+    const cell = this.pointerToCell(pointer);
+    entity.x = GRID_OFFSET_X + cell.col * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
+    entity.y = GRID_OFFSET_Y + cell.row * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
 
     // 拖拽中 → 同步移动图形
     const gfx = entity instanceof DragonFeederLogic
@@ -845,23 +953,28 @@ export class FactoryScene extends Phaser.Scene {
     const entity = this.factoryWorld.getEntityById(this.buildingDragTarget.entityId);
     if (!entity) { this.buildingDragTarget = null; return; }
 
-    // 网格吸附
+    // 建造模式：grid 吸附到最近格子（已在 updateBuildingDrag 中吸附，这里做最终确认）
     const cell = this.pointerToCell(pointer);
+    const snappedX = GRID_OFFSET_X + cell.col * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
+    const snappedY = GRID_OFFSET_Y + cell.row * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
+
+    // 检查目标位置是否被占用（排除自身）
     if (!this.isCellOccupied(cell.col, cell.row)) {
-      entity.x = GRID_OFFSET_X + cell.col * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
-      entity.y = GRID_OFFSET_Y + cell.row * GRID_CELL_SIZE + GRID_CELL_SIZE / 2;
-      // 同步图形
-      const gfx = entity instanceof DragonFeederLogic
-        ? this.feederGfx
-        : (entity instanceof MachineLogic ? this.machineGfx.get(entity.id) : this.sourceGfx.get(entity.id));
-      if (gfx) { gfx.setPosition(entity.x, entity.y); }
-      const statusTxt = this.machineStatusTexts.get(entity.id);
-      if (statusTxt instanceof Phaser.GameObjects.Text) {
-        statusTxt.setPosition(entity.x, entity.y + 55);
-      }
-    } else {
-      // 被占用 → 回到原位（通过 occupiedCells 可判断原位置）
+      entity.x = snappedX;
+      entity.y = snappedY;
     }
+    // 如果目标被占用，保持原位
+
+    // 同步图形到最终位置
+    const gfx = entity instanceof DragonFeederLogic
+      ? this.feederGfx
+      : (entity instanceof MachineLogic ? this.machineGfx.get(entity.id) : this.sourceGfx.get(entity.id));
+    if (gfx) { gfx.setPosition(entity.x, entity.y); }
+    const statusTxt = this.machineStatusTexts.get(entity.id);
+    if (statusTxt instanceof Phaser.GameObjects.Text) {
+      statusTxt.setPosition(entity.x, entity.y + 55);
+    }
+
     this.refreshOccupiedCells();
     this.rebuildAllBeltLines();
     this.buildingDragTarget = null;
@@ -875,7 +988,6 @@ export class FactoryScene extends Phaser.Scene {
     if (this.buildToolbar) {
       this.buildToolbar.destroy();
       this.buildToolbar = null;
-      this.uiElements = this.uiElements.filter(el => el.active !== false);
     }
     const container = this.trackUI(this.add.container(0, 0).setDepth(50));
     const startX = 40;
@@ -1119,17 +1231,44 @@ export class FactoryScene extends Phaser.Scene {
 
   private refreshOccupiedCells(): void {
     this.occupiedCells.clear();
+    // Source: 60×60 ≈ 2×2 格
     for (const src of this.factoryWorld.sources) {
-      const c = this.posToCell(src.x, src.y);
-      this.occupiedCells.add(`${c.col},${c.row}`);
+      this.markOccupiedArea(src.x, src.y, 60, 60);
+    }
+    // Machine: 90×110 ≈ 3×4 格
+    for (const m of this.factoryWorld.machines) {
+      this.markOccupiedArea(m.x, m.y, 90, 110);
+    }
+    // Feeder: 72×72 ≈ 3×3 格
+    if (this.factoryWorld.feeder) {
+      this.markOccupiedArea(this.factoryWorld.feeder.x, this.factoryWorld.feeder.y, 72, 72);
+    }
+  }
+
+  /** 刷新占用格（排除指定建筑，拖拽时避免自己挡住自己） */
+  private refreshOccupiedCellsExcept(excludeId: string): void {
+    this.occupiedCells.clear();
+    for (const src of this.factoryWorld.sources) {
+      if (src.id !== excludeId) this.markOccupiedArea(src.x, src.y, 60, 60);
     }
     for (const m of this.factoryWorld.machines) {
-      const c = this.posToCell(m.x, m.y);
-      this.occupiedCells.add(`${c.col},${c.row}`);
+      if (m.id !== excludeId) this.markOccupiedArea(m.x, m.y, 90, 110);
     }
-    if (this.factoryWorld.feeder) {
-      const c = this.posToCell(this.factoryWorld.feeder.x, this.factoryWorld.feeder.y);
-      this.occupiedCells.add(`${c.col},${c.row}`);
+    if (this.factoryWorld.feeder && this.factoryWorld.feeder.id !== excludeId) {
+      this.markOccupiedArea(this.factoryWorld.feeder.x, this.factoryWorld.feeder.y, 72, 72);
+    }
+  }
+
+  /** 标记一个矩形区域占用的所有网格格（防止建筑视觉重叠） */
+  private markOccupiedArea(cx: number, cy: number, w: number, h: number): void {
+    const halfW = w / 2;
+    const halfH = h / 2;
+    const c0 = this.posToCell(cx - halfW + 1, cy - halfH + 1);
+    const c1 = this.posToCell(cx + halfW - 1, cy + halfH - 1);
+    for (let col = c0.col; col <= c1.col; col++) {
+      for (let row = c0.row; row <= c1.row; row++) {
+        this.occupiedCells.add(`${col},${row}`);
+      }
     }
   }
 }

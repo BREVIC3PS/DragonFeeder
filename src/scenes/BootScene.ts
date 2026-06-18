@@ -1,6 +1,8 @@
 import Phaser from 'phaser';
 import { EventBus } from '../events/EventBus';
 import { GameClock } from '../utils/GameClock';
+import { TICK_RATE, INIT_FOOD_INVENTORY } from '../data/GameConfig';
+import { DragonState } from '../core/dragon/DragonState';
 
 /**
  * BootScene — 启动场景
@@ -19,10 +21,10 @@ export class BootScene extends Phaser.Scene {
   create(): void {
     // ── 创建核心子系统 ──
 
-    // GameClock：10Hz 逻辑帧驱动器
+    // GameClock：固定 Hz 逻辑帧驱动器（频率从 GameConfig.TICK_RATE 读取）
     // 存储在 registry 中，所有场景都能访问
     // HUDScene 负责每帧调用 gameClock.update()（因为只有它永不 sleep）
-    const gameClock = new GameClock(10); // 10Hz = 每 100ms 一次逻辑帧
+    const gameClock = new GameClock(TICK_RATE);
     this.game.registry.set('gameClock', gameClock);
 
     // EventBus 已在 events/EventBus.ts 中作为单例导出
@@ -32,29 +34,14 @@ export class BootScene extends Phaser.Scene {
 
     // ── 初始化全局共享数据（放在 Phaser Game Registry 中） ──
 
-    // 龙宝宝初始状态
-    this.game.registry.set('dragonState', {
-      hunger: 50,
-      happiness: 50,
-      dragonScales: 10, // 初始 10 龙鳞，供工厂生产测试（Step 7 实现自动产出）
-    });
+    // 龙宝宝状态：在 BootScene 阶段就创建 DragonState 实例，
+    // 这样 FactoryScene.create() 中读取时也能拿到正确实例（DragonScene 不再覆盖它）
+    this.game.registry.set('dragonState', new DragonState());
 
-    // 工厂世界状态（将在 Step 4 填充）
-    this.game.registry.set('factoryWorld', {
-      sources: [],
-      machines: [],
-      belts: [],
-      feeders: [],
-    });
+    // 食物库存（从 GameConfig 拷贝，避免直接共享同一引用导致配置被运行时修改）
+    this.game.registry.set('foodInventory', { ...INIT_FOOD_INVENTORY });
 
-    // 食物库存
-    this.game.registry.set('foodInventory', {
-      bread: 10,
-      meat: 5,
-      cake: 3,
-    });
-
-    console.log('[BootScene] 核心子系统已初始化：GameClock(10Hz) + EventBus');
+    console.log(`[BootScene] 核心子系统已初始化：GameClock(${TICK_RATE}Hz) + EventBus`);
 
     // ── 启动三个并行场景 ──
 

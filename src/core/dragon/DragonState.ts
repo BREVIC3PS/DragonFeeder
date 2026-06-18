@@ -8,6 +8,12 @@
  * - 不做数据校验（上层逻辑保证合法性）
  */
 
+import {
+  DRAGON_INIT_HUNGER, DRAGON_INIT_HAPPINESS, DRAGON_INIT_SCALES,
+  MOOD_HAPPY_HAPPINESS, MOOD_HAPPY_MAX_HUNGER,
+  MOOD_HUNGRY_THRESHOLD, MOOD_UNHAPPY_THRESHOLD,
+} from '../../data/GameConfig';
+
 export type DragonMood = 'happy' | 'normal' | 'hungry' | 'unhappy';
 
 /** 4 种心情对应的颜色（供渲染层读取） */
@@ -20,27 +26,33 @@ export const MOOD_COLORS: Record<DragonMood, number> = {
 
 export class DragonState {
   /** 饥饿度 0-100（0=饱了，100=极度饥饿） */
-  hunger: number = 50;
+  hunger: number = DRAGON_INIT_HUNGER;
 
   /** 满意度 0-100（0=不开心，100=非常开心） */
-  happiness: number = 50;
+  happiness: number = DRAGON_INIT_HAPPINESS;
 
   /** 龙鳞数量（货币） */
-  dragonScales: number = 10;
+  dragonScales: number = DRAGON_INIT_SCALES;
+
+  /** 互动统计：累计抚摸次数 */
+  totalPats: number = 0;
+
+  /** 互动统计：累计点击次数 */
+  totalClicks: number = 0;
 
   /**
    * 当前心情（由 hunger 和 happiness 计算得出）
    *
    * 判定优先级（从高到低）：
-   * 1. 开心：满意度 ≥ 80 且不饿（hunger < 50）
-   * 2. 饥饿：饥饿度 ≥ 70
-   * 3. 不开心：满意度 < 30
+   * 1. 开心：满意度 ≥ MOOD_HAPPY_HAPPINESS 且不饿（hunger < MOOD_HAPPY_MAX_HUNGER）
+   * 2. 饥饿：饥饿度 ≥ MOOD_HUNGRY_THRESHOLD
+   * 3. 不开心：满意度 < MOOD_UNHAPPY_THRESHOLD
    * 4. 普通：其余情况
    */
   get mood(): DragonMood {
-    if (this.happiness >= 80 && this.hunger < 50) return 'happy';
-    if (this.hunger >= 70) return 'hungry';
-    if (this.happiness < 30) return 'unhappy';
+    if (this.happiness >= MOOD_HAPPY_HAPPINESS && this.hunger < MOOD_HAPPY_MAX_HUNGER) return 'happy';
+    if (this.hunger >= MOOD_HUNGRY_THRESHOLD) return 'hungry';
+    if (this.happiness < MOOD_UNHAPPY_THRESHOLD) return 'unhappy';
     return 'normal';
   }
 

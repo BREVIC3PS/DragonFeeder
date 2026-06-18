@@ -49,6 +49,12 @@ export class SourceLogic {
   /**
    * 每逻辑帧调用
    * @param boostMult 加速倍率（1.0 = 正常，2.0 = 双倍速度）
+   *
+   * Timer 行为说明：
+   * - 缓冲区有空位时：循环消耗 timer 产出物品（高倍率下单帧可产出多个）
+   * - 缓冲区已满时：截断 timer 至 ≤ effectiveInterval，避免长期满载后
+   *   timer 累积过大、清空时瞬间爆产
+   * - 这是有意行为：不"补产"已经过去的产能，让满载状态下的产能回归"按需供给"
    */
   update(boostMult: number): void {
     const effectiveInterval = this.produceInterval / boostMult;
@@ -108,6 +114,9 @@ export class MachineLogic {
   private currentTotalTicks: number = 0;
   /** 缺料详情：缺什么、需要多少、当前有多少 */
   missingInputs: { type: ItemType; needed: number; available: number }[] = [];
+
+  /** 被阻塞的输出端口（缓冲区已满，无法放入产物） */
+  blockedOutputPorts: Set<number> = new Set();
 
   /** 渲染坐标（纯数字，无 Phaser 依赖） */
   x: number = 0;
@@ -172,12 +181,33 @@ export class MachineLogic {
     }
 
     // 检查输出缓冲区是否有空间
-    const totalOutputSlots = this.outputBuffers.reduce((sum, buf) => sum + (this.maxOutputPerPort - buf.length), 0);
-    const outputItemCount = this.recipe.outputs.reduce((sum, o) => sum + o.count, 0);
-    if (totalOutputSlots < outputItemCount) {
+    // 必须与 completeProduction 的填入策略保持一致（按端口 0→1→2 顺序）：
+    // 仅依靠"剩余空间总和"会出现误判（例如 port0/port1 满 + port2 空，
+    // total>=1 但 completeProduction 实际只能塞 port2，无法表达端口绑定语义）。
+    // 这里直接模拟一次填入，能塞下才认为输出有空间。
+    const simulatedFree = this.outputBuffers.map(buf => this.maxOutputPerPort - buf.length);
+    let outputFits = true;
+    for (const output of this.recipe.outputs) {
+      let remaining = output.count;
+      for (let port = 0; port < 3 && remaining > 0; port++) {
+        const take = Math.min(simulatedFree[port], remaining);
+        simulatedFree[port] -= take;
+        remaining -= take;
+      }
+      if (remaining > 0) { outputFits = false; break; }
+    }
+    if (!outputFits) {
       this.status = MachineStatus.OutputBlocked;
+      // 标记哪些输出端口满了（供渲染层标红）
+      this.blockedOutputPorts.clear();
+      for (let port = 0; port < 3; port++) {
+        if (this.outputBuffers[port].length >= this.maxOutputPerPort) {
+          this.blockedOutputPorts.add(port);
+        }
+      }
       return false;
     }
+    this.blockedOutputPorts.clear();
 
     // 检查每个输入原料是否有足够数量（在任何端口）
     const needed = new Map<ItemType, number>();
@@ -309,6 +339,9 @@ export class BeltSegment {
   /** 带上的物品队列 */
   private queue: BeltItem[] = [];
 
+  /** 传送带最大容量（防止物品无限堆积）。按长度×2 计算，例如 length=8 → 最多 16 个物品 */
+  private get maxCapacity(): number { return this.length * 2; }
+
   constructor(
     id: string,
     source: SourceLogic | MachineLogic,
@@ -327,14 +360,18 @@ export class BeltSegment {
 
   /**
    * 每逻辑帧调用：
-   * 1. 带上的物品前进一格
+   * 1. 带上的物品前进一格（受前一个物品占位约束，不会穿透）
    * 2. 到达终点的物品推入目标端口
    * 3. 从源端口拉取新物品到带上
    */
   update(): void {
-    // 物品前进
+    // 物品前进：遵循"前一个物品占位约束"，避免队首被卡住时后方物品穿过它
+    // blockMin 表示后一个物品的 remaining 不能小于 (前一个物品的 remaining + 1)
+    let blockMin = -Infinity;
     for (const entry of this.queue) {
-      entry.remaining--;
+      const next = entry.remaining - 1;
+      entry.remaining = Math.max(next, blockMin + 1);
+      blockMin = entry.remaining;
     }
 
     // 到达终点的物品 → 推入目标
@@ -348,8 +385,8 @@ export class BeltSegment {
       }
     }
 
-    // 从源拉取新物品
-    if (this.destObj.canAcceptInput(this.destPort)) {
+    // 从源拉取新物品（需要目标能接收 + 传送带自身未满）
+    if (this.queue.length < this.maxCapacity && this.destObj.canAcceptInput(this.destPort)) {
       const item = this.sourceObj.pullOutput(this.sourcePort);
       if (item) {
         this.queue.push({ type: item, remaining: this.length });
@@ -383,7 +420,8 @@ export class BeltSegment {
 
 export class DragonFeederLogic {
   readonly id: string;
-  inputBuffers: ItemType[][] = [[], [], []];
+  /** 动态输入端口数组：自动扩展，支持无限个端口接入传送带 */
+  inputBuffers: ItemType[][] = [];
 
   /** 渲染坐标（纯数字，无 Phaser 依赖） */
   x: number = 0;
@@ -395,8 +433,16 @@ export class DragonFeederLogic {
     this.id = id;
   }
 
+  /** 确保端口数组足够大，返回指定端口的缓冲区 */
+  private ensurePort(port: number): ItemType[] {
+    while (this.inputBuffers.length <= port) {
+      this.inputBuffers.push([]);
+    }
+    return this.inputBuffers[port];
+  }
+
   update(): void {
-    for (let port = 0; port < 3; port++) {
+    for (let port = 0; port < this.inputBuffers.length; port++) {
       const buffer = this.inputBuffers[port];
       while (buffer.length > 0) {
         const item = buffer.shift()!;
@@ -409,19 +455,25 @@ export class DragonFeederLogic {
   }
 
   receiveInput(item: ItemType, port: number): boolean {
-    if (port < 0 || port >= 3) return false;
-    if (this.inputBuffers[port].length >= this.maxBuffer) return false;
-    this.inputBuffers[port].push(item);
+    if (port < 0) return false;
+    const buf = this.ensurePort(port);
+    if (buf.length >= this.maxBuffer) return false;
+    buf.push(item);
     return true;
   }
 
   canAcceptInput(port: number): boolean {
-    if (port < 0 || port >= 3) return false;
-    return this.inputBuffers[port].length < this.maxBuffer;
+    if (port < 0) return false;
+    return this.ensurePort(port).length < this.maxBuffer;
   }
 
   pullOutput(_port: number): null {
     return null;
+  }
+
+  /** 已连接的端口数（至少有一个传送带接入的端口） */
+  getConnectedPortCount(): number {
+    return this.inputBuffers.length;
   }
 
   getInputCount(port: number): number {
@@ -505,24 +557,24 @@ export class FactoryWorld {
   getEntityById(id: string): SourceLogic | MachineLogic | DragonFeederLogic | null {
     return this.sources.find(s => s.id === id)
       ?? this.machines.find(m => m.id === id)
-      ?? this.feeder;
+      ?? (this.feeder?.id === id ? this.feeder : null);
   }
 
-  /** 删除采集器 + 关联传送带 */
+  /** 删除采集器 + 关联传送带（被删的 belt 由 GC 回收，物品队列随之释放） */
   removeSource(id: string): boolean {
     const idx = this.sources.findIndex(s => s.id === id);
     if (idx === -1) return false;
     this.sources.splice(idx, 1);
-    this.belts = this.belts.filter(b => b.sourceObj.id !== id);
+    this.removeBeltsBy(b => b.sourceObj.id === id);
     return true;
   }
 
-  /** 删除机器 + 关联传送带 */
+  /** 删除机器 + 关联传送带（输入和输出端的传送带都会被清掉） */
   removeMachine(id: string): boolean {
     const idx = this.machines.findIndex(m => m.id === id);
     if (idx === -1) return false;
     this.machines.splice(idx, 1);
-    this.belts = this.belts.filter(b => b.sourceObj.id !== id && b.destObj.id !== id);
+    this.removeBeltsBy(b => b.sourceObj.id === id || b.destObj.id === id);
     return true;
   }
 
@@ -534,12 +586,18 @@ export class FactoryWorld {
     return true;
   }
 
-  /** 删除喂食仓 + 关联传送带 */
+  /** 删除喂食仓 + 关联传送带（指向它的输入 belt 全部移除） */
   removeFeeder(): boolean {
     if (!this.feeder) return false;
-    this.belts = this.belts.filter(b => b.destObj.id !== this.feeder!.id);
+    const feederId = this.feeder.id;
+    this.removeBeltsBy(b => b.destObj.id === feederId);
     this.feeder = null;
     return true;
+  }
+
+  /** 内部：按谓词移除传送带（统一入口，未来可加埋点/日志） */
+  private removeBeltsBy(predicate: (b: BeltSegment) => boolean): void {
+    this.belts = this.belts.filter(b => !predicate(b));
   }
 
   /**
