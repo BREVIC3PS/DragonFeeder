@@ -121,6 +121,9 @@ export const BELT_LENGTHS: Record<string, number> = {
   default: 8,             // 玩家手动创建的传送带默认长度
 };
 
+/** 传送带每格可容纳的物品数量（maxCapacity = length × BELT_CAPACITY_PER_TILE） */
+export const BELT_CAPACITY_PER_TILE = 2;
+
 // ═══════════════════════════════════════════════════════════════
 // 九、工厂 — 喂食仓
 // ═══════════════════════════════════════════════════════════════

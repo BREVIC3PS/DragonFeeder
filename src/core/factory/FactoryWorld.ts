@@ -5,7 +5,7 @@ import { RECIPES } from './Recipe';
 import { EventBus } from '../../events/EventBus';
 import { MachineStatus } from './MachineStatus';
 import {
-  SOURCE_INTERVALS, BELT_LENGTHS,
+  SOURCE_INTERVALS, BELT_LENGTHS, BELT_CAPACITY_PER_TILE,
   SOURCE_MAX_BUFFER, MACHINE_MAX_INPUT, MACHINE_MAX_OUTPUT, FEEDER_MAX_BUFFER,
 } from '../../data/GameConfig';
 
@@ -98,10 +98,10 @@ export class MachineLogic {
   readonly id: string;
   recipe: RecipeDef | null;
 
-  /** 3 个输入端口 */
-  inputBuffers: ItemType[][] = [[], [], []];
-  /** 3 个输出端口 */
-  outputBuffers: ItemType[][] = [[], [], []];
+  /** 输入端口（数量由配方决定，inputBuffers.length = recipe.inputs.length） */
+  inputBuffers: ItemType[][] = [];
+  /** 输出端口（数量由配方决定，outputBuffers.length = recipe.outputs.length） */
+  outputBuffers: ItemType[][] = [];
 
   private readonly maxInputPerPort = MACHINE_MAX_INPUT;
   private readonly maxOutputPerPort = MACHINE_MAX_OUTPUT;
@@ -118,6 +118,11 @@ export class MachineLogic {
   /** 被阻塞的输出端口（缓冲区已满，无法放入产物） */
   blockedOutputPorts: Set<number> = new Set();
 
+  /** 利用率追踪：累计 tick 数 */
+  totalTicks: number = 0;
+  /** 利用率追踪：处于 Running 状态的 tick 数 */
+  runningTicks: number = 0;
+
   /** 渲染坐标（纯数字，无 Phaser 依赖） */
   x: number = 0;
   y: number = 0;
@@ -125,10 +130,29 @@ export class MachineLogic {
   constructor(id: string, recipe?: RecipeDef) {
     this.id = id;
     this.recipe = recipe ?? null;
+    this.resizeBuffers();
+  }
+
+  /** 根据当前配方动态调整端口缓冲区大小 */
+  private resizeBuffers(): void {
+    const inputPorts = this.recipe ? this.recipe.inputs.length : 0;
+    const outputPorts = this.recipe ? this.recipe.outputs.length : 0;
+
+    // 保留已有物品（截断多余端口，补充缺失端口）
+    this.inputBuffers = this.inputBuffers.slice(0, inputPorts);
+    while (this.inputBuffers.length < inputPorts) {
+      this.inputBuffers.push([]);
+    }
+
+    this.outputBuffers = this.outputBuffers.slice(0, outputPorts);
+    while (this.outputBuffers.length < outputPorts) {
+      this.outputBuffers.push([]);
+    }
   }
 
   setRecipe(recipe: RecipeDef): void {
     this.recipe = recipe;
+    this.resizeBuffers();
     // 换配方后重置
     this.productionTimer = 0;
     this.status = MachineStatus.Idle;
@@ -142,6 +166,12 @@ export class MachineLogic {
     return this.productionTimer / (10 * boostMult);
   }
 
+  /** 获取机器利用率（0-1），供渲染层显示效率 */
+  getUtilization(): number {
+    if (this.totalTicks === 0) return 0;
+    return this.runningTicks / this.totalTicks;
+  }
+
   /**
    * 每逻辑帧调用
    *
@@ -153,7 +183,10 @@ export class MachineLogic {
   update(boostMult: number): void {
     if (!this.recipe) return;
 
+    this.totalTicks++;
+
     if (this.status === MachineStatus.Running) {
+      this.runningTicks++;
       // boost 加速：每帧扣除 boostMult 个 tick（而非 1 个）
       this.productionTimer -= boostMult;
       if (this.productionTimer <= 0) {
@@ -189,7 +222,7 @@ export class MachineLogic {
     let outputFits = true;
     for (const output of this.recipe.outputs) {
       let remaining = output.count;
-      for (let port = 0; port < 3 && remaining > 0; port++) {
+      for (let port = 0; port < this.outputBuffers.length && remaining > 0; port++) {
         const take = Math.min(simulatedFree[port], remaining);
         simulatedFree[port] -= take;
         remaining -= take;
@@ -200,7 +233,7 @@ export class MachineLogic {
       this.status = MachineStatus.OutputBlocked;
       // 标记哪些输出端口满了（供渲染层标红）
       this.blockedOutputPorts.clear();
-      for (let port = 0; port < 3; port++) {
+      for (let port = 0; port < this.outputBuffers.length; port++) {
         if (this.outputBuffers[port].length >= this.maxOutputPerPort) {
           this.blockedOutputPorts.add(port);
         }
@@ -266,7 +299,7 @@ export class MachineLogic {
     for (const output of this.recipe.outputs) {
       let remaining = output.count;
       // 优先放入非空端口（端口 0 → 1 → 2）
-      for (let port = 0; port < 3 && remaining > 0; port++) {
+      for (let port = 0; port < this.outputBuffers.length && remaining > 0; port++) {
         while (this.outputBuffers[port].length < this.maxOutputPerPort && remaining > 0) {
           this.outputBuffers[port].push(output.type);
           remaining--;
@@ -278,20 +311,20 @@ export class MachineLogic {
 
   /** 传送带调用：从指定输出端口取走一个物品 */
   pullOutput(port: number): ItemType | null {
-    if (port < 0 || port >= 3) return null;
+    if (port < 0 || port >= this.outputBuffers.length) return null;
     return this.outputBuffers[port].shift() ?? null;
   }
 
   /** 传送带调用：给指定输入端口放入一个物品 */
   receiveInput(item: ItemType, port: number): boolean {
-    if (port < 0 || port >= 3) return false;
+    if (port < 0 || port >= this.inputBuffers.length) return false;
     if (this.inputBuffers[port].length >= this.maxInputPerPort) return false;
     this.inputBuffers[port].push(item);
     return true;
   }
 
   canAcceptInput(port: number): boolean {
-    if (port < 0 || port >= 3) return false;
+    if (port < 0 || port >= this.inputBuffers.length) return false;
     return this.inputBuffers[port].length < this.maxInputPerPort;
   }
 
@@ -339,8 +372,8 @@ export class BeltSegment {
   /** 带上的物品队列 */
   private queue: BeltItem[] = [];
 
-  /** 传送带最大容量（防止物品无限堆积）。按长度×2 计算，例如 length=8 → 最多 16 个物品 */
-  private get maxCapacity(): number { return this.length * 2; }
+  /** 传送带最大容量（防止物品无限堆积）。按长度×BELT_CAPACITY_PER_TILE 计算 */
+  private get maxCapacity(): number { return this.length * BELT_CAPACITY_PER_TILE; }
 
   constructor(
     id: string,
@@ -530,6 +563,22 @@ export class FactoryWorld {
     const belt = new BeltSegment(this.genId('belt'), source, sourcePort, dest, destPort, length);
     this.belts.push(belt);
     return belt;
+  }
+
+  /** 获取全局工厂效率统计 */
+  getStats(): { running: number; total: number; blocked: number; avgBeltFullness: number; avgUtilization: number } {
+    const total = this.machines.length;
+    const running = this.machines.filter(m => m.status === MachineStatus.Running).length;
+    const blocked = this.machines.filter(m => m.status === MachineStatus.InputBlocked || m.status === MachineStatus.OutputBlocked).length;
+    let avgBeltFullness = 0;
+    if (this.belts.length > 0) {
+      avgBeltFullness = this.belts.reduce((sum, b) => sum + b.getQueueLength() / (b.length * BELT_CAPACITY_PER_TILE), 0) / this.belts.length;
+    }
+    let avgUtilization = 0;
+    if (total > 0) {
+      avgUtilization = this.machines.reduce((sum, m) => sum + m.getUtilization(), 0) / total;
+    }
+    return { running, total, blocked, avgBeltFullness, avgUtilization };
   }
 
   /**
